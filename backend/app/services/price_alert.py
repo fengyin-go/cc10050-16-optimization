@@ -2,6 +2,9 @@
 
 数据链路位置：告警判定层，消费比价计算器产出的价差比例与变价历史，
 触发结果写入通知渠道并沉淀到变价历史流水。
+
+升级点：规则携带显式「规则版本」，事件判定必须引用具体报价快照与规则版本；
+阈值修订产生新版本，旧版本上的判定与交付凭据保持可追溯。
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ class PriceAlertService(BaseModuleService):
     MODULE = "price_alert"
     ENTITY = "告警规则"
     OPERATION_TERM = "校验"
-    LIST_FIELDS = ["规则名称", "监控商品", "价差阈值", "连续次数", "通知渠道"]
+    LIST_FIELDS = ["规则名称", "监控商品", "价差阈值", "连续次数", "通知渠道", "规则版本"]
     REQUIRED_FIELDS = ["规则名称", "监控商品", "价差阈值"]
     STATUS_ORDER = ["待生效", "已生效", "已关闭"]
     ACTION_RULES = {"启用规则": "已生效", "关闭规则": "已关闭"}
@@ -25,7 +28,7 @@ class PriceAlertService(BaseModuleService):
     # ---- 业务扩展：阈值判定与告警触发 ----
 
     def enable_rule(self, entry_id: int) -> dict[str, Any]:
-        """启用告警规则，校验阈值与连续次数口径。"""
+        """启用告警规则，校验阈值与连续次数口径，并锁定规则版本。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": f"{self.ENTITY} {entry_id} 不存在"}
@@ -41,9 +44,37 @@ class PriceAlertService(BaseModuleService):
         times = str(entry.get("连续次数", "") or "")
         if not times.isdigit() or int(times) < 1:
             entry["连续次数"] = "3"
+        if not str(entry.get("规则版本") or "").strip():
+            entry["规则版本"] = "v1"
         entry["status"] = "已生效"
         entry["pending"] = False
-        return {"ok": True, "message": f"规则 {entry.get('规则名称', '')} 已生效"}
+        return {"ok": True, "message": f"规则 {entry.get('规则名称', '')} 已生效（{entry['规则版本']}）"}
+
+    def revise_rule(self, entry_id: int, new_threshold: str, reason: str) -> dict[str, Any]:
+        """修订阈值并升级规则版本；历史判定仍引用旧版本，不被覆盖。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "规则不存在"}
+        if not new_threshold.endswith("%"):
+            return {"ok": False, "message": "价差阈值必须以百分号结尾"}
+        try:
+            if float(new_threshold.rstrip("%")) <= 0:
+                return {"ok": False, "message": "价差阈值必须为正数"}
+        except ValueError:
+            return {"ok": False, "message": "价差阈值数值无效"}
+        old_version = str(entry.get("规则版本") or "v1")
+        try:
+            version_no = int(old_version.lstrip("v") or "1")
+        except ValueError:
+            version_no = 1
+        entry["价差阈值"] = new_threshold
+        entry["规则版本"] = f"v{version_no + 1}"
+        return {
+            "ok": True,
+            "message": f"规则已按「{reason}」修订：{old_version} → {entry['规则版本']}",
+            "old_version": old_version,
+            "new_version": entry["规则版本"],
+        }
 
     def evaluate_change(self, entry_id: int, ratio: float) -> dict[str, Any]:
         """按规则阈值判定一次变价是否触发告警。"""
